@@ -37,6 +37,9 @@ type scanner struct {
 	timeout time.Duration
 }
 
+// hashicorp/mdns 的 ServiceEntry 不暴露 DNS RR TTL，库默认记录 TTL 为 120 秒。
+const defaultMDNSTTL uint32 = 120
+
 func parsePorts(spec string) (map[int]bool, error) {
 	result := make(map[int]bool)
 	for _, item := range strings.Split(spec, ",") {
@@ -83,7 +86,7 @@ func (s *scanner) inScope(ip net.IP) bool {
 	return ip != nil && s.network.Contains(ip)
 }
 
-func (s *scanner) probe(ctx context.Context, ip string, port int) string {
+func (s *scanner) probe(ctx context.Context, ip string, port int, service string) string {
 	address := net.JoinHostPort(ip, strconv.Itoa(port))
 	dialer := net.Dialer{Timeout: s.timeout}
 	conn, err := dialer.DialContext(ctx, "tcp", address)
@@ -91,28 +94,31 @@ func (s *scanner) probe(ctx context.Context, ip string, port int) string {
 		return ""
 	}
 	defer conn.Close()
+	// HTTP 类服务先发送请求，再读取响应，避免等待服务主动发送 banner。
+	if isHTTPService(service) {
+		_ = conn.SetWriteDeadline(time.Now().Add(s.timeout))
+		_, _ = io.WriteString(conn, "GET / HTTP/1.0\r\nHost: "+ip+"\r\nUser-Agent: mdnsmap\r\n\r\n")
+		_ = conn.SetReadDeadline(time.Now().Add(s.timeout))
+		buffer := make([]byte, 4096)
+		count, _ := conn.Read(buffer)
+		if count > 0 {
+			return strings.TrimSpace(string(buffer[:count]))
+		}
+		return ""
+	}
 	_ = conn.SetReadDeadline(time.Now().Add(s.timeout))
 	buffer := make([]byte, 4096)
 	count, _ := conn.Read(buffer)
 	if count > 0 {
 		return strings.TrimSpace(string(buffer[:count]))
 	}
-	// HTTP 服务通常等待请求后才返回 banner，因此补发一个最小请求。
-	if port == 80 || port == 443 || port == 5000 || port == 8080 || port == 8443 {
-		_ = conn.SetWriteDeadline(time.Now().Add(s.timeout))
-		_, _ = io.WriteString(conn, "GET / HTTP/1.0\r\nHost: "+ip+"\r\nUser-Agent: mdnsmap\r\n\r\n")
-		_ = conn.SetReadDeadline(time.Now().Add(s.timeout))
-		count, _ = conn.Read(buffer)
-		if count > 0 {
-			return strings.TrimSpace(string(buffer[:count]))
-		}
-	}
 	return ""
 }
 
 func (s *scanner) queryService(ctx context.Context, service string) ([]Asset, error) {
 	entries := make(chan *mdns.ServiceEntry, 128)
-	params := mdns.DefaultParams(service)
+	// hashicorp/mdns 会自动追加 Domain=local，因此这里必须传入不带 .local 的类型。
+	params := mdns.DefaultParams(normalizeServiceQuery(service))
 	params.Timeout = s.timeout
 	params.Entries = entries
 	params.DisableIPv6 = false
@@ -134,13 +140,13 @@ func (s *scanner) queryService(ctx context.Context, service string) ([]Asset, er
 			if ip == nil || !s.inScope(ip) || !s.ports[entry.Port] {
 				continue
 			}
-			asset := Asset{IP: ip.String(), Port: entry.Port, Service: cleanService(service), Host: instanceDisplayName(entry.Name), Hostname: strings.TrimSuffix(entry.Host, "."), TTL: 120, TXT: parseTXT(entry.InfoFields)}
+			asset := Asset{IP: ip.String(), Port: entry.Port, Service: cleanService(service), Host: instanceDisplayName(entry.Name), Hostname: strings.TrimSuffix(entry.Host, "."), TTL: defaultMDNSTTL, TXT: parseTXT(entry.InfoFields)}
 			if entry.AddrV6IPAddr != nil {
 				asset.IPv6 = entry.AddrV6IPAddr.IP.String()
 			} else if entry.AddrV6 != nil {
 				asset.IPv6 = entry.AddrV6.String()
 			}
-			asset.Banner = s.probe(ctx, asset.IP, asset.Port)
+			asset.Banner = s.probe(ctx, asset.IP, asset.Port, asset.Service)
 			assets = append(assets, asset)
 		case err := <-queryDone:
 			return assets, err
@@ -151,9 +157,28 @@ func (s *scanner) queryService(ctx context.Context, service string) ([]Asset, er
 }
 
 func cleanService(service string) string {
-	service = strings.TrimSuffix(service, ".local")
-	service = strings.TrimSuffix(service, ".")
-	return strings.TrimPrefix(service, "_")
+	service = strings.TrimSuffix(strings.TrimSpace(service), ".")
+	parts := strings.Split(service, ".")
+	for _, part := range parts {
+		if strings.HasPrefix(part, "_") && part != "_tcp" && part != "_udp" {
+			return strings.TrimPrefix(part, "_")
+		}
+	}
+	return strings.TrimPrefix(parts[0], "_")
+}
+
+func isHTTPService(service string) bool {
+	service = strings.ToLower(cleanService(service))
+	return service == "http" || service == "https"
+}
+
+// normalizeServiceQuery 将完整的 mDNS 服务类型转换为库要求的 _服务._协议格式。
+func normalizeServiceQuery(service string) string {
+	service = strings.TrimSuffix(strings.TrimSpace(service), ".")
+	if strings.HasSuffix(strings.ToLower(service), ".local") {
+		service = service[:len(service)-len(".local")]
+	}
+	return strings.TrimSuffix(service, ".")
 }
 
 // serviceTypeFromName 从 mDNS 实例全名提取 _服务._tcp.local 类型名。
@@ -178,35 +203,9 @@ func instanceDisplayName(name string) string {
 }
 
 func (s *scanner) scan(ctx context.Context) ([]Asset, error) {
-	meta := make(chan *mdns.ServiceEntry, 128)
-	params := mdns.DefaultParams("_services._dns-sd._udp")
-	params.Timeout = s.timeout
-	params.Entries = meta
-	ctx, cancel := context.WithTimeout(ctx, s.timeout+300*time.Millisecond)
-	defer cancel()
-	if err := mdns.QueryContext(ctx, params); err != nil {
+	services, err := s.discoverServices(ctx)
+	if err != nil {
 		return nil, err
-	}
-	services := make(map[string]bool)
-	for {
-		select {
-		case entry := <-meta:
-			if entry != nil {
-				name := serviceTypeFromName(entry.Name)
-				if name != "" {
-					services[name] = true
-				}
-			}
-		default:
-			goto queried
-		}
-	}
-queried:
-	if len(services) == 0 {
-		// 常见服务类型作为显式查询，便于设备未发布 meta-query 时仍能发现资产。
-		services["_http._tcp.local"] = true
-		services["_workstation._tcp.local"] = true
-		services["_smb._tcp.local"] = true
 	}
 	var all []Asset
 	var mu sync.Mutex
@@ -233,6 +232,44 @@ queried:
 		return all[i].Service < all[j].Service
 	})
 	return dedupe(all), nil
+}
+
+// discoverServices 先枚举网段内设备发布的服务类型，再交给单独查询获取实例详情。
+func (s *scanner) discoverServices(ctx context.Context) (map[string]bool, error) {
+	meta := make(chan *mdns.ServiceEntry, 128)
+	params := mdns.DefaultParams("_services._dns-sd._udp")
+	params.Timeout = s.timeout
+	params.Entries = meta
+	queryCtx, cancel := context.WithTimeout(ctx, s.timeout+300*time.Millisecond)
+	defer cancel()
+	if err := mdns.QueryContext(queryCtx, params); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		return nil, err
+	}
+	services := make(map[string]bool)
+	for {
+		select {
+		case entry := <-meta:
+			if entry != nil {
+				name := serviceTypeFromName(entry.Name)
+				if name != "" {
+					services[name] = true
+				}
+			}
+		default:
+			goto queried
+		}
+	}
+queried:
+	if len(services) == 0 {
+		// 常见服务类型作为显式查询，覆盖未发布 meta-query 的设备。
+		for _, service := range []string{
+			"_http._tcp.local", "_workstation._tcp.local", "_smb._tcp.local",
+			"_qdiscover._tcp.local", "_device-info._tcp.local", "_afpovertcp._tcp.local",
+		} {
+			services[service] = true
+		}
+	}
+	return services, nil
 }
 
 func dedupe(input []Asset) []Asset {
