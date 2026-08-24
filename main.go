@@ -156,6 +156,18 @@ func cleanService(service string) string {
 	return strings.TrimPrefix(service, "_")
 }
 
+// serviceTypeFromName 从 mDNS 实例全名提取 _服务._tcp.local 类型名。
+func serviceTypeFromName(name string) string {
+	name = strings.TrimSuffix(name, ".")
+	parts := strings.Split(name, ".")
+	for i := 0; i+2 < len(parts); i++ {
+		if strings.HasPrefix(parts[i], "_") && (parts[i+1] == "_tcp" || parts[i+1] == "_udp") {
+			return strings.Join(parts[i:i+3], ".")
+		}
+	}
+	return name
+}
+
 func (s *scanner) scan(ctx context.Context) ([]Asset, error) {
 	meta := make(chan *mdns.ServiceEntry, 128)
 	params := mdns.DefaultParams("_services._dns-sd._udp")
@@ -171,7 +183,7 @@ func (s *scanner) scan(ctx context.Context) ([]Asset, error) {
 		select {
 		case entry := <-meta:
 			if entry != nil {
-				name := strings.TrimSuffix(entry.Name, ".")
+				name := serviceTypeFromName(entry.Name)
 				if name != "" {
 					services[name] = true
 				}

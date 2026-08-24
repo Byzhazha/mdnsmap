@@ -27,3 +27,9 @@ func TestScannerScope(t *testing.T) {
 		t.Fatal("网段过滤错误")
 	}
 }
+
+func TestServiceTypeFromName(t *testing.T) {
+	if got := serviceTypeFromName("slw-nas._qdiscover._tcp.local."); got != "_qdiscover._tcp.local" {
+		t.Fatalf("服务类型提取错误: %s", got)
+	}
+}
