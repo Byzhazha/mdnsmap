@@ -134,7 +134,7 @@ func (s *scanner) queryService(ctx context.Context, service string) ([]Asset, er
 			if ip == nil || !s.inScope(ip) || !s.ports[entry.Port] {
 				continue
 			}
-			asset := Asset{IP: ip.String(), Port: entry.Port, Service: cleanService(service), Host: strings.TrimSuffix(entry.Name, "."), Hostname: strings.TrimSuffix(entry.Host, "."), TTL: 120, TXT: parseTXT(entry.InfoFields)}
+			asset := Asset{IP: ip.String(), Port: entry.Port, Service: cleanService(service), Host: instanceDisplayName(entry.Name), Hostname: strings.TrimSuffix(entry.Host, "."), TTL: 120, TXT: parseTXT(entry.InfoFields)}
 			if entry.AddrV6IPAddr != nil {
 				asset.IPv6 = entry.AddrV6IPAddr.IP.String()
 			} else if entry.AddrV6 != nil {
@@ -164,6 +164,15 @@ func serviceTypeFromName(name string) string {
 		if strings.HasPrefix(parts[i], "_") && (parts[i+1] == "_tcp" || parts[i+1] == "_udp") {
 			return strings.Join(parts[i:i+3], ".")
 		}
+	}
+	return name
+}
+
+// instanceDisplayName 将“设备._http._tcp.local”转换为示例中的设备名。
+func instanceDisplayName(name string) string {
+	name = strings.TrimSuffix(name, ".")
+	if index := strings.Index(name, "._"); index > 0 {
+		return name[:index]
 	}
 	return name
 }

@@ -33,3 +33,9 @@ func TestServiceTypeFromName(t *testing.T) {
 		t.Fatalf("服务类型提取错误: %s", got)
 	}
 }
+
+func TestInstanceDisplayName(t *testing.T) {
+	if got := instanceDisplayName("slw-nas._http._tcp.local."); got != "slw-nas" {
+		t.Fatalf("实例名提取错误: %s", got)
+	}
+}
